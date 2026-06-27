@@ -1,8 +1,8 @@
 # dataset / model weights / results
 saved/
-*.pdf
-paper.txt
-report.md
+# *.pdf
+# paper.txt
+# report.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

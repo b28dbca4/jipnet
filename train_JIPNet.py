@@ -16,15 +16,18 @@ import os.path as osp
 import random
 import shutil
 
-import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import yaml
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from data_loader import get_dataloader_train, get_dataloader_valid
+from data_loader import load_dataset_train
 from loss import CompareAlignLoss
 from models.JIPNet import JIPNet
 
@@ -47,68 +50,61 @@ def train(
     cfg,
     save_dir=None,
     save_checkpoint=15,
+    rank=0,
+    train_sampler=None,
 ):
-    # -------------- init settings-------------- #
     lr = cfg["train_cfg"]["lr"]
     end_lr = cfg["train_cfg"]["end_lr"]
-    optim = cfg["train_cfg"]["optimizer"]
+    optim_name = cfg["train_cfg"]["optimizer"]
     scheduler_type = cfg["train_cfg"]["scheduler_type"]
     num_epoch = cfg["train_cfg"]["epochs"]
 
-    if valid_dataloader is None:
-        valid = False
-    else:
-        valid = True
+    valid = valid_dataloader is not None
+    is_main = rank == 0
 
-    # -------------- some global functions -------------- #
     criterion = CompareAlignLoss()
 
-    # -------------- select optimizer -------------- #
-    if optim == "sgd":
+    if optim_name == "sgd":
         optimizer = torch.optim.SGD(
-            (param for param in model.parameters() if param.requires_grad),
+            (p for p in model.parameters() if p.requires_grad),
             lr=lr,
             weight_decay=0,
         )
-
-    elif optim == "adam":
+    elif optim_name == "adam":
         optimizer = torch.optim.Adam(
-            (param for param in model.parameters() if param.requires_grad),
+            (p for p in model.parameters() if p.requires_grad),
             lr=lr,
             weight_decay=1e-3,
         )
-
-    elif optim == "adamW":
+    elif optim_name == "adamW":
         optimizer = torch.optim.AdamW(
-            (param for param in model.parameters() if param.requires_grad),
+            (p for p in model.parameters() if p.requires_grad),
             lr=lr,
             weight_decay=1e-2,
         )
 
-    # -------------- select scheduler -------------- #
     if scheduler_type == "CosineAnnealingLR":
-        scheduler = CosineAnnealingLR(
-            optimizer, T_max=np.round(num_epoch), eta_min=end_lr
-        )
-
+        scheduler = CosineAnnealingLR(optimizer, T_max=num_epoch, eta_min=end_lr)
     elif scheduler_type == "StepLR":
         scheduler = StepLR(optimizer, 15, 0.1)
 
-    # -------------- train & valid -------------- #
     for epoch in range(num_epoch):
-        # train phase
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         model.train()
-        train_losses = {
-            "total": 0,
-            "focal": 0,
-            "Lr": 0,
-        }
-        logging.info(
-            "epoch: {}, lr:{:.8f}".format(
-                epoch, optimizer.state_dict()["param_groups"][0]["lr"]
+        train_losses = {"total": 0.0, "focal": 0.0, "Lr": 0.0}
+
+        if is_main:
+            logging.info(
+                "epoch: {}, lr:{:.8f}".format(
+                    epoch, optimizer.state_dict()["param_groups"][0]["lr"]
+                )
             )
-        )
-        pbar = tqdm(train_dataloader, desc=f"epoch:{epoch}, train")
+            pbar = tqdm(train_dataloader, desc=f"epoch:{epoch}, train")
+        else:
+            pbar = train_dataloader
+
         for input1, input2, align_target, target in pbar:
             input1 = input1.float().to(device)
             input2 = input2.float().to(device)
@@ -116,53 +112,48 @@ def train(
             target = target[:, 0:1].float().to(device)
 
             cla_pred, align_pred = model([input1, input2])
-
             loss, items = criterion(cla_pred, target, align_pred, align_target)
-            klist = items.keys()
-            for k in klist:
+
+            for k in items:
                 train_losses[k] += items[k] / len(train_dataloader)
             train_losses["total"] += loss.item() / len(train_dataloader)
-            pbar.set_postfix(**{"loss": loss.item()})
+
+            if is_main:
+                pbar.set_postfix(loss=loss.item())
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             del loss
 
-        pbar.close()
-
-        klist = train_losses.keys()
-        logging_info = "\tTRAIN epoch {}: ".format(epoch)
-        for k in klist:
-            logging_info = logging_info + "{}:{:.4f}, ".format(k, train_losses[k])
-        logging.info(logging_info)
+        if is_main:
+            pbar.close()
+            logging_info = "\tTRAIN epoch {}: ".format(epoch)
+            for k in train_losses:
+                logging_info += "{}:{:.4f}, ".format(k, train_losses[k])
+            logging.info(logging_info)
 
         scheduler.step()
 
-        if save_dir is not None and epoch > save_checkpoint:
-            if hasattr(model, "module"):
-                torch.save(
-                    model.module.state_dict(),
-                    osp.join(save_dir, f"epoch_{epoch}.pth"),
-                )
-            else:
-                torch.save(
-                    model.state_dict(),
-                    osp.join(save_dir, f"epoch_{epoch}.pth"),
-                )
+        if is_main and save_dir is not None and epoch > save_checkpoint:
+            state = (
+                model.module.state_dict()
+                if hasattr(model, "module")
+                else model.state_dict()
+            )
+            torch.save(state, osp.join(save_dir, f"epoch_{epoch}.pth"))
 
-        # valid phase
-        if valid is False:
+        if not valid:
             continue
+
         model.eval()
         with torch.no_grad():
-            valid_losses = {
-                "total": 0,
-                "focal": 0,
-                "Lr": 0,
-            }
-            pbar = tqdm(valid_dataloader, desc=f"epoch:{epoch}, val")
+            valid_losses = {"total": 0.0, "focal": 0.0, "Lr": 0.0}
+            pbar = (
+                tqdm(valid_dataloader, desc=f"epoch:{epoch}, val")
+                if is_main
+                else valid_dataloader
+            )
 
             for input1, input2, align_target, target in pbar:
                 input1 = input1.float().to(device)
@@ -171,78 +162,29 @@ def train(
                 target = target[:, 0:1].float().to(device)
 
                 cla_pred, align_pred = model([input1, input2])
-
                 loss, items = criterion(cla_pred, target, align_pred, align_target)
-                klist = items.keys()
-                for k in klist:
+
+                for k in items:
                     valid_losses[k] += items[k] / len(valid_dataloader)
                 valid_losses["total"] += loss.item() / len(valid_dataloader)
-                pbar.set_postfix(**{"loss": loss.item()})
-
                 del loss
 
-            pbar.close()
-
-            klist = valid_losses.keys()
-            logging_info = "\tVALID epoch {}: ".format(epoch)
-            for k in klist:
-                logging_info = logging_info + "{}:{:.4f}, ".format(k, valid_losses[k])
-            logging.info(logging_info)
-
-    return
+            if is_main:
+                pbar.close()
+                logging_info = "\tVALID epoch {}: ".format(epoch)
+                for k in valid_losses:
+                    logging_info += "{}:{:.4f}, ".format(k, valid_losses[k])
+                logging.info(logging_info)
 
 
-if __name__ == "__main__":
-    set_seed(seed=7)
+def main_worker(rank, world_size, gpu_ids, cfg, save_dir, train_info, valid_info):
+    set_seed(seed=7 + rank)
 
-    current_path = os.path.abspath(__file__)
-    config_path = osp.join(osp.dirname(current_path), "configs", "JIPNet.yaml")
-    with open(config_path, "r") as config:
-        cfg = yaml.safe_load(config)
+    local_gpu = gpu_ids[rank]
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(local_gpu)
+    device = torch.device(f"cuda:{local_gpu}")
 
-    # set save dir
-    save_basedir = osp.join(cfg["save_cfg"]["save_basedir"], cfg["model_cfg"]["model"])
-    if cfg["save_cfg"]["save_title"] == "time":
-        now = datetime.datetime.now()
-        save_dir = osp.join(save_basedir, now.strftime("%Y-%m-%d-%H-%M-%S"))
-    else:
-        save_dir = osp.join(save_basedir, cfg["save_cfg"]["save_title"])
-
-    if not osp.exists(save_dir):
-        os.makedirs(save_dir)
-
-    shutil.copy(config_path, osp.join(save_dir, "config.yaml"))
-
-    # set database
-    train_info_path = cfg["db_cfg"]["train_info_path"]
-    valid_info_path = cfg["db_cfg"]["valid_info_path"]
-
-    train_info = np.load(train_info_path, allow_pickle=True).item()
-    valid_info = np.load(valid_info_path, allow_pickle=True).item()
-
-    # logging losses
-    logging_path = osp.join(save_dir, "info.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s: %(message)s",
-        filename=logging_path,
-        filemode="w",
-    )
-
-    train_loader = get_dataloader_train(
-        info_lst=train_info["info_lst"],
-        patch_size=cfg["model_cfg"]["input_size"],
-        batch_size=cfg["train_cfg"]["batch_size"],
-        shuffle=True,
-    )
-
-    valid_loader = get_dataloader_valid(
-        info_lst=valid_info["info_lst"],
-        patch_size=cfg["model_cfg"]["input_size"],
-        batch_size=cfg["train_cfg"]["batch_size"],
-    )
-
-    # set models
     model = JIPNet(
         input_size=cfg["model_cfg"]["input_size"],
         img_channel=cfg["model_cfg"]["img_channel"],
@@ -258,29 +200,106 @@ if __name__ == "__main__":
         dec_nhead=cfg["model_cfg"]["dec_nhead"],
         dec_local_num=cfg["model_cfg"]["dec_local_num"],
         encoder_pretrain_pth=cfg["pretrain_cfg"]["encoder_pth"],
-    )
-
-    logging.info("Model: {}".format(cfg["model_cfg"]["model"]))
-
-    device = torch.device(
-        "cuda:{}".format(str(cfg["train_cfg"]["cuda_ids"][0]))
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    model = torch.nn.DataParallel(
-        model,
-        device_ids=cfg["train_cfg"]["cuda_ids"],
-        output_device=cfg["train_cfg"]["cuda_ids"][0],
     ).to(device)
 
-    logging.info("******** begin training ********")
+    model = DDP(model, device_ids=[local_gpu], output_device=local_gpu)
+
+    # Total batch_size is split evenly across GPUs
+    batch_per_gpu = max(1, cfg["train_cfg"]["batch_size"] // world_size)
+
+    train_dataset = load_dataset_train(
+        info_lst=train_info["info_lst"],
+        patch_size=cfg["model_cfg"]["input_size"],
+        use_augmentation=True,
+    )
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_per_gpu,
+        sampler=train_sampler,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    # Validation only on rank 0 to avoid duplicate logging
+    valid_loader = None
+    if rank == 0 and valid_info is not None:
+        valid_dataset = load_dataset_train(
+            info_lst=valid_info["info_lst"],
+            patch_size=cfg["model_cfg"]["input_size"],
+            use_augmentation=False,
+        )
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=batch_per_gpu,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+        )
+
+    if rank == 0:
+        logging.info("Model     : {}".format(cfg["model_cfg"]["model"]))
+        logging.info("World size: {}  (GPUs: {})".format(world_size, gpu_ids))
+        logging.info("Batch/GPU : {}  (total: {})".format(
+            batch_per_gpu, batch_per_gpu * world_size))
+        logging.info("Train samples: {}".format(len(train_dataset)))
+        logging.info("******** begin training ********")
+
     train(
         model=model,
         train_dataloader=train_loader,
         valid_dataloader=valid_loader,
         device=device,
         cfg=cfg,
-        save_dir=save_dir,
+        save_dir=save_dir if rank == 0 else None,
         save_checkpoint=cfg["train_cfg"]["epochs"] - 6,
+        rank=rank,
+        train_sampler=train_sampler,
+    )
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    current_path = os.path.abspath(__file__)
+    config_path = osp.join(osp.dirname(current_path), "configs", "JIPNet.yaml")
+    with open(config_path, "r") as config:
+        cfg = yaml.safe_load(config)
+
+    # set save dir
+    save_basedir = osp.join(cfg["save_cfg"]["save_basedir"], cfg["model_cfg"]["model"])
+    if cfg["save_cfg"]["save_title"] == "time":
+        now = datetime.datetime.now()
+        save_dir = osp.join(save_basedir, now.strftime("%Y-%m-%d-%H-%M-%S"))
+    else:
+        save_dir = osp.join(save_basedir, cfg["save_cfg"]["save_title"])
+
+    os.makedirs(save_dir, exist_ok=True)
+    shutil.copy(config_path, osp.join(save_dir, "config.yaml"))
+
+    train_info = np.load(cfg["db_cfg"]["train_info_path"], allow_pickle=True).item()
+    valid_info = np.load(cfg["db_cfg"]["valid_info_path"], allow_pickle=True).item()
+
+    logging_path = osp.join(save_dir, "info.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+        filename=logging_path,
+        filemode="w",
+    )
+
+    # Allow overriding via environment (e.g. torchrun sets these automatically)
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "12355")
+
+    gpu_ids = cfg["train_cfg"]["cuda_ids"]
+    world_size = len(gpu_ids)
+
+    mp.spawn(
+        main_worker,
+        args=(world_size, gpu_ids, cfg, save_dir, train_info, valid_info),
+        nprocs=world_size,
+        join=True,
     )

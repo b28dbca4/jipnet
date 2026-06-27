@@ -72,34 +72,149 @@ opencv_contrib_python==4.10.0.84
 opencv_python==4.8.1.78
 PyYAML==6.0.2
 scipy==1.15.2
-skimage==0.0
+scikit-image>=0.19
 timm==0.9.12
 torch==2.1.2
 tqdm==4.66.1
+```
+
+Install all dependencies:
+```shell
+pip install -r requirements.txt
 ```
 
 <br>
 
 
 
+## About the 5 Datasets in the Paper
+
+The paper evaluates on **5 public datasets** (NIST SD14, FVC2002 DB1A/DB3A, FVC2004 DB1A/DB2A, FVC2006 DB1A). These are **test-only** — they are used only for `inference.py`, not for training.
+
+Training was done on the authors' private "Hybrid DB". If you want to retrain, you need your own fingerprint data: images with FVC-style naming (`{FINGER_ID}_{IMPRESSION_ID}.png`) and multiple impressions per finger so genuine pairs can be generated.
+
+<br>
+
+## Dataset Structure
+
+Each dataset used for training goes through its own pipeline and lives in its own sub-directory. The `build_manifest.py` script then merges their pair lists.
+
+```
+JIPNet/
+├── data/                              # manifest files (built by build_manifest.py)
+│   ├── train.npy
+│   └── valid.npy
+│
+└── data_affine/
+    ├── DatasetA/                      # e.g. your own DB, or FVC2002_DB1A
+    │   ├── img/                       # aligned full-fingerprint images
+    │   │   ├── 1_1.png                # naming: {FINGER_ID}_{IMPRESSION_ID}.png
+    │   │   ├── 1_2.png
+    │   │   └── ...
+    │   ├── mask_erode/                # binary foreground masks (same naming)
+    │   └── results/                   # output of generate_patch.py
+    │       ├── img/                   # cropped patch pairs
+    │       │   ├── 0_1.png
+    │       │   ├── 0_2.png
+    │       │   └── ...
+    │       └── info/                  # pair metadata (.txt files)
+    │           ├── 0.txt
+    │           └── ...
+    │
+    ├── DatasetB/                      # a second dataset (optional)
+    │   ├── img/
+    │   ├── mask_erode/
+    │   └── results/
+    │       └── info/
+    └── ...
+```
+
+> **Why separate sub-directories?** Each run of `generate_patch.py` starts its pair counter (`generate_idx`) from 0. Two datasets would produce files named `0_1.png`, `1_1.png`, ... that would collide if written to the same folder. Keeping them in separate `results/` directories avoids this. The `.txt` files store **absolute paths** so the training code finds the images correctly regardless of where they live.
+
+Each `info/*.txt` file has 6 lines:
+
+```
+File for patch_info. from top to left: img_path1/2, info1/2, gt, ...
+/abs/path/to/DatasetA/results/img/0_1.png
+/abs/path/to/DatasetA/results/img/0_2.png
+row1 col1 theta1          # centre position and rotation angle of patch 1
+row2 col2 theta2          # centre position and rotation angle of patch 2
+1                         # ground-truth label: 1=genuine pair, 0=impostor
+```
+
+<br>
+
 ## Train
-:point_up: If you want to train JIPNet, please first construct the training set and overview file `example.npy` in the form of the following example:
-```
-|-data
-  |-img/...         # images for training
-  |-info/...        # pair info for training
-  |-example.npy   # overview file
+
+### Step 1 — Generate training data
+
+See the **Train Data Generation** section below. Run `generate_patch.py` **once per dataset**, pointing `--base_dir` to that dataset's folder:
+
+```shell
+# Dataset A
+python make_data/generate_patch.py --base_dir ./data_affine/DatasetA
+
+# Dataset B (optional second dataset)
+python make_data/generate_patch.py --base_dir ./data_affine/DatasetB
 ```
 
-:point_up: Next, you need to adjust the file path, network structure, and training parameters according to your needs:
-```
-./configs/JIPNet.yaml
+Each run writes its output to `<base_dir>/results/img/` and `<base_dir>/results/info/` automatically.
+
+### Step 2 — Build manifest files
+
+After generating all datasets, run `build_manifest.py` to merge and split:
+
+```shell
+# Single dataset
+python make_data/build_manifest.py \
+    --info_dirs ./data_affine/DatasetA/results/info
+
+# Two or more datasets — just list all info directories
+python make_data/build_manifest.py \
+    --info_dirs ./data_affine/DatasetA/results/info \
+                ./data_affine/DatasetB/results/info
 ```
 
-:point_up: Finally, set the corresponding configuration path in the training file to train JIPNet !
+This collects all `.txt` pair files, shuffles, applies an 80/20 split, and writes `data/train.npy` + `data/valid.npy`. Missing datasets are automatically skipped with a warning — you do not need all datasets present.
+
+Control the split ratio:
+```shell
+python make_data/build_manifest.py \
+    --info_dirs ./data_affine/DatasetA/results/info \
+    --train_ratio 0.9 \
+    --seed 123
+```
+
+Then update `configs/JIPNet.yaml`:
+
+```yaml
+db_cfg:
+  train_info_path: ./data/train.npy
+  valid_info_path: ./data/valid.npy
+```
+
+### Step 3 — Configure training
+
+Edit `configs/JIPNet.yaml` to match your setup:
+
+```yaml
+train_cfg:
+  lr: 1.0e-3
+  end_lr: 1.0e-6
+  epochs: 16
+  batch_size: 128       # total across all GPUs
+  cuda_ids: [0]         # single GPU; use [0, 1] for 2-GPU training
+  scheduler_type: CosineAnnealingLR
+  optimizer: adamW
+```
+
+### Step 4 — Train
+
 ```shell
 python train_JIPNet.py
 ```
+
+Checkpoints and `info.log` are saved to `./saved/JIPNet/<save_title>/`.
 
 :triangular_flag_on_post: The pretrained encoder is uploaded at `./JIPNet/encoder_bath.pth` in this [link](https://drive.google.com/drive/folders/1q9yopPjOFt9c9odCT1o4nheLvwrJaCu7?usp=sharing).
 
@@ -108,6 +223,56 @@ https://github.com/XiongjunGuan/FpEnhancer
 
 Note that the network of above repository‌ has been adjusted, and its weight cannot be directly applied to JIPNet.
 
+<br>
+
+## Multi-GPU Training (Kaggle / 2×T4)
+
+The training script uses **DistributedDataParallel (DDP)** with `torch.multiprocessing.spawn`, so you only need to change one line in the config to enable multi-GPU:
+
+```yaml
+# configs/JIPNet.yaml
+train_cfg:
+  batch_size: 128       # total batch size — automatically divided by number of GPUs
+  cuda_ids: [0, 1]      # list every GPU index you want to use
+```
+
+Then run the same command:
+
+```shell
+python train_JIPNet.py
+```
+
+The script will:
+- Launch one process per GPU listed in `cuda_ids`
+- Distribute `batch_size` evenly (64 per GPU for 2 GPUs)
+- Use `DistributedSampler` so each GPU sees a non-overlapping slice of the dataset each epoch
+- Only GPU 0 writes checkpoints and logs
+
+**Kaggle notebook setup** — paste at the top of your notebook cell before training:
+
+```python
+import subprocess, sys
+
+# Install dependencies
+subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "-q"])
+
+# Verify two GPUs are visible
+import torch
+print(f"GPUs available: {torch.cuda.device_count()}")   # expect 2 for 2×T4
+
+# Set environment for DDP (already set by train_JIPNet.py, shown here for clarity)
+import os
+os.environ["MASTER_ADDR"] = "localhost"
+os.environ["MASTER_PORT"] = "12355"
+```
+
+Then in the next cell:
+
+```python
+!python train_JIPNet.py
+```
+
+> **Note**: Kaggle provides 2×T4 (each 16 GB). With `batch_size: 128` and `cuda_ids: [0, 1]`, each GPU processes 64 samples — well within the 16 GB limit for `input_size: 160`.
 
 :sparkles: At present, the training code has not been fully organized yet, and there may be some bugs that have not been discovered. Please feel free to discuss with me. :kissing_heart:
 

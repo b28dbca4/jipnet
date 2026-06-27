@@ -228,18 +228,31 @@ def make_data(ftitle_lst, iter=2, ring_r_max=80, patch_size=128):
 
 
 if __name__ == "__main__":
-    base_dir = "./data_affine/"
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate fingerprint patch pairs for training.")
+    parser.add_argument("--base_dir", default="./data_affine/",
+                        help="Dataset root dir containing img/ and mask_erode/ sub-dirs.")
+    parser.add_argument("--save_dir", default=None,
+                        help="Output dir for results/. Defaults to <base_dir>/results/.")
+    parser.add_argument("--iter", type=int, default=4,
+                        help="Number of genuine pairs sampled per image pair (default: 4).")
+    parser.add_argument("--ring_r_max", type=int, default=100,
+                        help="Max ring radius for second keypoint sampling (default: 100).")
+    parser.add_argument("--patch_size", type=int, default=160,
+                        help="Output patch size in pixels (default: 160).")
+    args = parser.parse_args()
+
+    base_dir = args.base_dir
     img_dir = osp.join(base_dir, "img")
     mask_dir = osp.join(base_dir, "mask_erode")
 
-    save_base_dir = "./data_affine/results/"
+    save_base_dir = args.save_dir if args.save_dir else osp.join(base_dir, "results")
     res_img_dir = osp.join(save_base_dir, "img")
     res_info_dir = osp.join(save_base_dir, "info")
 
-    if not osp.exists(res_img_dir):
-        os.makedirs(res_img_dir)
-    if not osp.exists(res_info_dir):
-        os.makedirs(res_info_dir)
+    os.makedirs(res_img_dir, exist_ok=True)
+    os.makedirs(res_info_dir, exist_ok=True)
 
     ftitle_lst = glob(osp.join(mask_dir, "*.png"))
     ftitle_lst = [osp.basename(x).replace(".png", "") for x in ftitle_lst]
@@ -247,4 +260,4 @@ if __name__ == "__main__":
         ftitle_lst,
         key=lambda x: 100 * int(x.split("_")[0]) + int(x.split("_")[1]))
 
-    make_data(ftitle_lst, iter=4, ring_r_max=100, patch_size=160)
+    make_data(ftitle_lst, iter=args.iter, ring_r_max=args.ring_r_max, patch_size=args.patch_size)
