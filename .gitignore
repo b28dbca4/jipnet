@@ -22,7 +22,7 @@ eggs/
 .eggs/
 lib/
 lib64/
-parts/
+parts//home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s01.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s02.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s03.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s04.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s05.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s06.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s07.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s08.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s09.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s10.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s11.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s12.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s13.wav /home/lang-phu-quy/Documents/Sem6/Pattern_Recognition/project/local_binary_pattern/audio/narration/s14.wav
 sdist/
 var/
 wheels/

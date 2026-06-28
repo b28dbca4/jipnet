@@ -4,7 +4,12 @@ train_cfg:
   lr: 1.0e-3
   end_lr: 1.0e-6
   epochs: 16
-  batch_size: 128
+
+  # Memory settings for 2×T4 (16 GB each)
+  # Effective batch = batch_size × accum_steps = 32 × 4 = 128  (matches paper)
+  batch_size: 32      # physical batch total across all GPUs (16 per GPU for 2×T4)
+  accum_steps: 4      # gradient accumulation steps
+  use_amp: true       # FP16 forward pass — cuts activation memory ~50%
   cuda_ids: [0, 1]
 
   # lr iteration

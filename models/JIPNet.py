@@ -50,9 +50,7 @@ class JIPNet(nn.Module):
 
         if encoder_pretrain_pth is not None:
             self.encoder.load_state_dict(
-                torch.load(encoder_pretrain_pth, map_location=f'cuda:0'))
-            # for p in self.encoder.parameters():
-            #     p.requires_grad = False
+                torch.load(encoder_pretrain_pth, map_location='cpu'))
 
         # ----- mid layers ----- #
         layers = []
@@ -82,14 +80,15 @@ class JIPNet(nn.Module):
             dp=0.0)
 
     def forward(self, inps):
-        batch_dim = inps[0].shape[0]
-        x = torch.cat(inps, dim=0)
-        x = self.encoder(x)
-        x = self.mid_layer(x)
-        [x0, x1] = torch.split(x, [batch_dim, batch_dim], dim=0)
+        # Process each image through the CNN separately to halve peak VRAM.
+        # (The original torch.cat approach doubles effective batch through encoder,
+        # which is the primary OOM cause on 16 GB GPUs.)
+        x0 = self.encoder(inps[0])
+        x0 = self.mid_layer(x0)
+        x1 = self.encoder(inps[1])
+        x1 = self.mid_layer(x1)
 
         cla_pred, align_pred = self.transformer_layer(x0, x1)
-
         cla_pred = torch.sigmoid(cla_pred)
 
         return cla_pred, align_pred

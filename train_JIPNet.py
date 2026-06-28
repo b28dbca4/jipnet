@@ -9,6 +9,7 @@ LastEditTime: 2025-04-25 15:16:37
 Copyright (C) 2025 by Xiongjun Guan, Tsinghua University. All rights reserved.
 """
 
+import contextlib
 import datetime
 import logging
 import os
@@ -58,11 +59,14 @@ def train(
     optim_name = cfg["train_cfg"]["optimizer"]
     scheduler_type = cfg["train_cfg"]["scheduler_type"]
     num_epoch = cfg["train_cfg"]["epochs"]
+    accum_steps = cfg["train_cfg"].get("accum_steps", 1)
+    use_amp = cfg["train_cfg"].get("use_amp", True)
 
     valid = valid_dataloader is not None
     is_main = rank == 0
 
     criterion = CompareAlignLoss()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     if optim_name == "sgd":
         optimizer = torch.optim.SGD(
@@ -105,14 +109,28 @@ def train(
         else:
             pbar = train_dataloader
 
-        for input1, input2, align_target, target in pbar:
+        optimizer.zero_grad()
+
+        for step, (input1, input2, align_target, target) in enumerate(pbar):
             input1 = input1.float().to(device)
             input2 = input2.float().to(device)
             align_target = align_target.float().to(device)
             target = target[:, 0:1].float().to(device)
 
-            cla_pred, align_pred = model([input1, input2])
-            loss, items = criterion(cla_pred, target, align_pred, align_target)
+            is_last_step = (step + 1) == len(train_dataloader)
+            is_accum_step = ((step + 1) % accum_steps == 0) or is_last_step
+
+            # Skip DDP gradient sync on intermediate accumulation steps
+            sync_ctx = contextlib.nullcontext() if is_accum_step else model.no_sync()
+
+            with sync_ctx:
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    cla_pred, align_pred = model([input1, input2])
+                    loss, items = criterion(cla_pred, target, align_pred, align_target)
+                    # Divide by accum_steps so gradients average correctly
+                    scaled_loss = loss / accum_steps
+
+                scaler.scale(scaled_loss).backward()
 
             for k in items:
                 train_losses[k] += items[k] / len(train_dataloader)
@@ -121,10 +139,12 @@ def train(
             if is_main:
                 pbar.set_postfix(loss=loss.item())
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            del loss
+            if is_accum_step:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            del loss, scaled_loss
 
         if is_main:
             pbar.close()
@@ -161,8 +181,9 @@ def train(
                 align_target = align_target.float().to(device)
                 target = target[:, 0:1].float().to(device)
 
-                cla_pred, align_pred = model([input1, input2])
-                loss, items = criterion(cla_pred, target, align_pred, align_target)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    cla_pred, align_pred = model([input1, input2])
+                    loss, items = criterion(cla_pred, target, align_pred, align_target)
 
                 for k in items:
                     valid_losses[k] += items[k] / len(valid_dataloader)
@@ -206,6 +227,8 @@ def main_worker(rank, world_size, gpu_ids, cfg, save_dir, train_info, valid_info
 
     # Total batch_size is split evenly across GPUs
     batch_per_gpu = max(1, cfg["train_cfg"]["batch_size"] // world_size)
+    accum_steps = cfg["train_cfg"].get("accum_steps", 1)
+    use_amp = cfg["train_cfg"].get("use_amp", True)
 
     train_dataset = load_dataset_train(
         info_lst=train_info["info_lst"],
@@ -223,7 +246,6 @@ def main_worker(rank, world_size, gpu_ids, cfg, save_dir, train_info, valid_info
         pin_memory=True,
     )
 
-    # Validation only on rank 0 to avoid duplicate logging
     valid_loader = None
     if rank == 0 and valid_info is not None:
         valid_dataset = load_dataset_train(
@@ -240,11 +262,14 @@ def main_worker(rank, world_size, gpu_ids, cfg, save_dir, train_info, valid_info
         )
 
     if rank == 0:
-        logging.info("Model     : {}".format(cfg["model_cfg"]["model"]))
-        logging.info("World size: {}  (GPUs: {})".format(world_size, gpu_ids))
-        logging.info("Batch/GPU : {}  (total: {})".format(
-            batch_per_gpu, batch_per_gpu * world_size))
-        logging.info("Train samples: {}".format(len(train_dataset)))
+        eff_batch = batch_per_gpu * world_size * accum_steps
+        logging.info("Model          : {}".format(cfg["model_cfg"]["model"]))
+        logging.info("World size     : {}  (GPUs: {})".format(world_size, gpu_ids))
+        logging.info("Batch/GPU      : {}".format(batch_per_gpu))
+        logging.info("Accum steps    : {}".format(accum_steps))
+        logging.info("Effective batch: {}".format(eff_batch))
+        logging.info("AMP enabled    : {}".format(use_amp))
+        logging.info("Train samples  : {}".format(len(train_dataset)))
         logging.info("******** begin training ********")
 
     train(
@@ -290,7 +315,6 @@ if __name__ == "__main__":
         filemode="w",
     )
 
-    # Allow overriding via environment (e.g. torchrun sets these automatically)
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "12355")
 
