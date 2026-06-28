@@ -23,7 +23,7 @@ class BinaryFocalLoss(nn.Module):
     https://github.com/lonePatient/TorchBlocks
     """
 
-    def __init__(self, gamma=2.0, alpha=0.2, epsilon=1.0e-9):
+    def __init__(self, gamma=2.0, alpha=0.2, epsilon=1.0e-7):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
@@ -37,21 +37,26 @@ class BinaryFocalLoss(nn.Module):
         Returns:
             shape of [batch_size]
         """
+        # Clamp BEFORE log so the value is always finite.
+        # Strategy: clamp to [eps, 1-eps] then call .log() directly (no +eps needed).
+        # Why clamp instead of +eps: FP16 sigmoid can return exact 0.0 (underflow),
+        # so (0.0 + 1e-9) = 1e-9 gives gradient 1/1e-9 = 1e9 which corrupts weights
+        # after a few epochs. Clamping ensures log() input is always ≥ eps.
+        logits = torch.clamp(input, min=self.epsilon, max=1.0 - self.epsilon)
         multi_hot_key = target
-        logits = input
-
         zero_hot_key = 1 - multi_hot_key
+
         loss = (
             -self.alpha
             * multi_hot_key
             * torch.pow((1 - logits), self.gamma)
-            * (logits + self.epsilon).log()
+            * logits.log()
         )
         loss += (
             -(1 - self.alpha)
             * zero_hot_key
             * torch.pow(logits, self.gamma)
-            * (1 - logits + self.epsilon).log()
+            * (1 - logits).log()
         )
         return loss.mean()
 

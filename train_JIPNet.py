@@ -123,15 +123,28 @@ def train(
             # Skip DDP gradient sync on intermediate accumulation steps
             sync_ctx = contextlib.nullcontext() if is_accum_step else model.no_sync()
 
-            with sync_ctx:
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    cla_pred, align_pred = model([input1, input2])
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                cla_pred, align_pred = model([input1, input2])
 
-                # Loss always in FP32 — prevents NaN from FP16 log/pow overflow
-                # (FP16 epsilon=1e-9 rounds to zero, causing log(0)=-inf → NaN)
-                loss, items = criterion(
-                    cla_pred.float(), target, align_pred.float(), align_target
-                )
+            # Loss in FP32: FP16 sigmoid can return exact 0.0 (underflow),
+            # computing log in FP16 would give -inf → NaN.
+            loss, items = criterion(
+                cla_pred.float(), target, align_pred.float(), align_target
+            )
+
+            # Guard: if loss is NaN/Inf, discard the whole accumulation window
+            # and start fresh rather than corrupting model weights.
+            if not torch.isfinite(loss):
+                if is_main:
+                    logging.warning(
+                        f"Non-finite loss ({loss.item()}) at epoch {epoch} "
+                        f"step {step} — skipping batch"
+                    )
+                optimizer.zero_grad()
+                del loss
+                continue
+
+            with sync_ctx:
                 scaled_loss = loss / accum_steps
                 scaler.scale(scaled_loss).backward()
 
