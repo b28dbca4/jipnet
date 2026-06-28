@@ -66,7 +66,7 @@ def train(
     is_main = rank == 0
 
     criterion = CompareAlignLoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     if optim_name == "sgd":
         optimizer = torch.optim.SGD(
@@ -124,7 +124,7 @@ def train(
             sync_ctx = contextlib.nullcontext() if is_accum_step else model.no_sync()
 
             with sync_ctx:
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     cla_pred, align_pred = model([input1, input2])
                     loss, items = criterion(cla_pred, target, align_pred, align_target)
                     # Divide by accum_steps so gradients average correctly
@@ -181,7 +181,7 @@ def train(
                 align_target = align_target.float().to(device)
                 target = target[:, 0:1].float().to(device)
 
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     cla_pred, align_pred = model([input1, input2])
                     loss, items = criterion(cla_pred, target, align_pred, align_target)
 

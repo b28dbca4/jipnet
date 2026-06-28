@@ -20,8 +20,8 @@ train_cfg:
 
 # traning database
 db_cfg:
-  train_info_path: ./data/example.npy
-  valid_info_path: ./data/example.npy
+  train_info_path: ./data/train.npy
+  valid_info_path: ./data/valid.npy
 
 # save settings
 save_cfg:
