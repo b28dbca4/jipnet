@@ -126,10 +126,13 @@ def train(
             with sync_ctx:
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     cla_pred, align_pred = model([input1, input2])
-                    loss, items = criterion(cla_pred, target, align_pred, align_target)
-                    # Divide by accum_steps so gradients average correctly
-                    scaled_loss = loss / accum_steps
 
+                # Loss always in FP32 — prevents NaN from FP16 log/pow overflow
+                # (FP16 epsilon=1e-9 rounds to zero, causing log(0)=-inf → NaN)
+                loss, items = criterion(
+                    cla_pred.float(), target, align_pred.float(), align_target
+                )
+                scaled_loss = loss / accum_steps
                 scaler.scale(scaled_loss).backward()
 
             for k in items:
@@ -166,7 +169,11 @@ def train(
         if not valid:
             continue
 
-        model.eval()
+        # Use model.module directly to bypass DDP collective ops.
+        # If we call model.forward() (the DDP wrapper) only on rank 0,
+        # the DDP _sync_params BROADCAST waits for rank 1 forever → NCCL timeout.
+        val_model = model.module if hasattr(model, "module") else model
+        val_model.eval()
         with torch.no_grad():
             valid_losses = {"total": 0.0, "focal": 0.0, "Lr": 0.0}
             pbar = (
@@ -182,8 +189,10 @@ def train(
                 target = target[:, 0:1].float().to(device)
 
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    cla_pred, align_pred = model([input1, input2])
-                    loss, items = criterion(cla_pred, target, align_pred, align_target)
+                    cla_pred, align_pred = val_model([input1, input2])
+                loss, items = criterion(
+                    cla_pred.float(), target, align_pred.float(), align_target
+                )
 
                 for k in items:
                     valid_losses[k] += items[k] / len(valid_dataloader)
@@ -196,6 +205,9 @@ def train(
                 for k in valid_losses:
                     logging_info += "{}:{:.4f}, ".format(k, valid_losses[k])
                 logging.info(logging_info)
+
+        # Restore DDP model to train mode for next epoch
+        model.train()
 
 
 def main_worker(rank, world_size, gpu_ids, cfg, save_dir, train_info, valid_info):
