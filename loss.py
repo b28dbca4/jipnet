@@ -118,12 +118,12 @@ class CompareAlignLoss(nn.Module):
 
         pred_b1 = align_pred[:, 0]
         pred_b2 = align_pred[:, 1]
-        cosT = torch.div(
-            pred_b1, eps + torch.sqrt(torch.square(pred_b1) + torch.square(pred_b2))
-        )
-        sinT = torch.div(
-            pred_b2, eps + torch.sqrt(torch.square(pred_b1) + torch.square(pred_b2))
-        )
+        # eps must be INSIDE sqrt so the gradient 1/(2√x) stays bounded.
+        # eps outside only prevents forward division-by-zero but gradient of
+        # sqrt(0) is still ∞, which causes NaN at initialisation when pred≈0.
+        norm = torch.sqrt(torch.square(pred_b1) + torch.square(pred_b2) + eps)
+        cosT = pred_b1 / norm
+        sinT = pred_b2 / norm
         pred_norm = torch.cat(
             [
                 cosT[:, None],

@@ -143,6 +143,9 @@ def train(
                 pbar.set_postfix(loss=loss.item())
 
             if is_accum_step:
+                # Unscale first so clip_grad_norm sees real gradient magnitudes
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -212,6 +215,17 @@ def train(
 
 def main_worker(rank, world_size, gpu_ids, cfg, save_dir, train_info, valid_info):
     set_seed(seed=7 + rank)
+
+    # logging.basicConfig must be called inside the child process spawned by
+    # mp.spawn — the parent's file handler is NOT inherited across process
+    # boundaries, so the log file would be empty if configured in __main__.
+    if rank == 0:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s: %(message)s",
+            filename=osp.join(save_dir, "info.log"),
+            filemode="w",
+        )
 
     local_gpu = gpu_ids[rank]
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
@@ -318,14 +332,6 @@ if __name__ == "__main__":
 
     train_info = np.load(cfg["db_cfg"]["train_info_path"], allow_pickle=True).item()
     valid_info = np.load(cfg["db_cfg"]["valid_info_path"], allow_pickle=True).item()
-
-    logging_path = osp.join(save_dir, "info.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s: %(message)s",
-        filename=logging_path,
-        filemode="w",
-    )
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "12355")
